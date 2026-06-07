@@ -613,3 +613,96 @@ class FeedForward(nn.Module):
         """
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.dropout(self.down_proj(gated))
+
+class TinyMindBlock(nn.Module):
+    """
+    TinyMind 模型的 Transformer 基础层（Block）。
+    
+    该类实现了 Pre-Norm 架构的标准 Transformer 层，将输入隐藏状态依次通过
+    自注意力机制和前馈神经网络（MLP），并使用残差连接进行特征融合。
+    
+    核心功能：
+        - 自注意力计算：通过内部 Attention 模块实现多头自注意力机制。
+        - 前馈网络：通过 FeedForward 模块对特征进行非线性变换。
+        - 层归一化：使用 RMSNorm 对自注意力层和 MLP 层的输入进行归一化。
+        - KV Cache：支持返回当前层的 Key/Value 缓存，以加速自回归生成。
+    
+    构造函数参数：
+        layer_id (int): 当前层的索引ID，用于区分模型中的不同层。
+        config (TinyMindConfig): 模型配置对象，包含如隐藏层大小、注意力头数、
+                                 归一化 epsilon 等构建该层所需的超参数。
+    
+    使用限制与副作用：
+        - 该层默认使用标准的 FeedForward 网络，代码中注释了 MOEFeedForward 的分支，
+          如果需要使用混合专家模型机制，需手动修改代码取消相关注释。
+        - 必须作为 nn.Module 的子类在模型框架中使用，不可独立进行前向传播。
+    
+    代码示例：
+        >>> config = TinyMindConfig(hidden_size=512, num_attention_heads=8, rms_norm_eps=1e-6)
+        >>> block = TinyMindBlock(layer_id=0, config=config)
+        >>> hidden_states = torch.randn(1, 10, 512)
+        >>> pos_emb = (torch.randn(1, 10, 64), torch.randn(1, 10, 64))
+        >>> output, present_kv = block(hidden_states, position_embeddings=pos_emb)
+    """
+    def __init__(self, layer_id: int, config: TinyMindConfig):
+        """
+        初始化 Transformer 模型层。
+        
+        Args:
+            layer_id (int): 当前层的索引ID。
+            config (TinyMindConfig): 模型配置对象，包含模型的各种超参数。
+        """
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.self_attention = Attention(config)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.mlp = FeedForward(config)
+            # if not config.use_moe
+            # else MOEFeedForward(config))
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache=False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        模型前向传播方法。
+
+        Args:
+            hidden_states (torch.Tensor): 输入的隐藏状态张量。
+            position_embeddings (Tuple[torch.Tensor, torch.Tensor]): 位置嵌入元组，通常包含位置和方向的嵌入。
+            past_key_value (Optional[Tuple[torch.Tensor, torch.Tensor]], optional): 过去计算的键值对元组，用于加速推理。默认为 None。
+            use_cache (bool, optional): 是否返回键值对以供后续推理使用。默认为 False。
+            attention_mask (Optional[torch.Tensor], optional): 注意力掩码张量，用于避免关注填充或未来的标记。默认为 None。
+
+        Returns:
+            Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: 
+                - hidden_states (torch.Tensor): 经过自注意力层和MLP层后的输出隐藏状态。
+                - present_key_value (Tuple[torch.Tensor, torch.Tensor]): 当前层的键值对，用于后续增量推理。
+        """
+        res = hidden_states
+
+        hidden_states, present_key_value = self.self_attention(
+            self.input_layernorm(hidden_states),  # pre-norm
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask,
+        )
+
+        hidden_states = res + hidden_states
+
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+        return hidden_states, present_key_value
