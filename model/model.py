@@ -1,10 +1,12 @@
 import math
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union, List
 from transformers import PretrainedConfig
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class TinyMindConfig(PretrainedConfig):
     """
@@ -198,8 +200,7 @@ def precompute_freqs_cis(
     dim: int,
     end: int(32 * 1024),
     rope_base: float = 1e6,
-    rope_scaling: Optional[dict] = None,
-):
+    rope_scaling: Optional[dict] = None):
     """
     预计算旋转位置编码的复数频率，支持标准 RoPE 和 YaRN (Yet another RoPE extensioN) 缩放策略。
 
@@ -706,3 +707,192 @@ class TinyMindBlock(nn.Module):
             self.post_attention_layernorm(hidden_states)
         )
         return hidden_states, present_key_value
+
+class TinyMindModel(nn.Module):
+    """
+    TinyMind 模型主体，基于 PyTorch 的 nn.Module 实现。
+
+    该类实现了一个基于 Transformer 架构的深度学习模型，主要用于自然语言处理任务（如语言建模、文本生成等）。
+    模型集成了词嵌入、多层 Transformer 块、层归一化以及旋转位置编码等核心组件。
+
+    核心功能:
+        - 词嵌入映射：将输入的 token ID 映射为高维隐藏层向量。
+        - 多层特征提取：通过堆叠的 TinyMindBlock 提取上下文特征。
+        - 旋转位置编码：利用预计算的余弦和正弦频率矩阵实现旋转位置编码。
+        - 输出归一化：通过 RMSNorm 对最终隐藏层状态进行归一化处理。
+
+    构造函数参数:
+        config (TinyMindConfig): 模型的配置对象，包含模型的各种超参数（如词表大小、隐藏层维度、
+                                 层数、Dropout 概率、最大序列长度、RoPE 参数等）。
+
+    使用示例:
+        >>> config = TinyMindConfig(vocab_size=32000, hidden_size=4096, num_hidden_layers=32)
+        >>> model = TinyMindModel(config)
+        >>> input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+        >>> hidden_states = model(input_ids)
+
+    使用限制与注意事项:
+        - 继承自 nn.Module，需遵循 PyTorch 模型的标准使用范式（如需调用 .to(device) 转移设备）。
+        - 预计算的旋转位置编码频率矩阵（freqs_cos, freqs_sin）以非持久化缓冲区（persistent=False）的形式
+          注册，在模型状态字典的保存和加载过程中不会被序列化，模型初始化时会自动重新计算。
+        - 模型的前向传播过程依赖于输入序列长度不超过 config.max_position_embeddings 的限制。
+    """
+    def __init__(self, config: TinyMindConfig):
+        """
+        初始化 TinyMind 模型主体。
+
+        Args:
+            config (TinyMindConfig): 模型的配置对象，包含模型的各种超参数。
+        """
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([TinyMindBlock(layer_idx, config) for layer_idx in range(self.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+        )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+            use_cache: bool = False,
+            **kwargs,
+        ):
+            """
+            模型的前向传播方法。
+
+            Args:
+                input_ids (Optional[torch.Tensor]): 输入序列的token索引张量，形状为 `(batch_size, seq_length)`。
+                attention_mask (Optional[torch.Tensor]): 注意力掩码张量，用于避免对填充token或未来token进行注意力计算。
+                past_key_values (Optional[List[Tuple[torch.Tensor, torch.Tensor]]]): 预计算的键和值隐藏状态（KV缓存），用于加速自回归生成。
+                use_cache (bool): 是否返回并使用KV缓存以加速后续生成，默认为 False。
+                **kwargs: 其他未使用的额外关键字参数。
+
+            Returns:
+                Tuple[torch.Tensor, List]: 包含两个元素的元组：
+                    - hidden_states (torch.Tensor): 最后一层输出的隐藏状态，经过层归一化处理。
+                    - presents (List): 各个解码器层的当前KV缓存状态列表，用于后续的前向传播。
+            """
+            batch_size, seq_length = input_ids.shape
+            if hasattr(past_key_values, 'layers'): past_key_values = None
+            past_key_values = past_key_values or [None] * len(self.layers)
+            start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+            hidden_states = self.dropout(self.embed_tokens(input_ids))
+            # Recompute RoPE buffers lost during meta-device init (transformers>=5.x)
+            if self.freqs_cos[0, 0] == 0:
+                freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
+                self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
+            position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
+            presents = []
+            for layer, past_key_value in zip[Any](self.layers, past_key_values):
+                hidden_states, present = layer(
+                    hidden_states,
+                    position_embeddings,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                    attention_mask=attention_mask
+                )
+                presents.append(present)
+            hidden_states = self.norm(hidden_states)
+            return hidden_states, presents
+
+"""
+TinyMind 因果语言模型。
+
+该类继承自 PreTrainedModel 和 GenerationMixin，用于因果语言建模任务（如文本生成）。
+它在 TinyMindModel 的基础上添加了语言模型头，将隐藏状态映射到词表空间以预测下一个词元的概率。
+
+核心功能:
+    - 因果语言建模的前向传播，计算 logits 和可选的隐藏状态。
+    - 支持自回归生成，通过 GenerationMixin 提供的 generate 方法实现文本生成。
+    - 支持 KV-Cache 加速推理（通过 past_key_values 和 use_cache 参数）。
+    - 支持选择性计算 logits（通过 logits_to_keep 参数）以优化长序列生成的显存和计算开销。
+
+构造函数参数:
+    config (TinyMindConfig): 模型的配置对象，包含模型的各种超参数（如隐藏层大小、词表大小等）。
+
+使用限制与副作用:
+    - 权重共享：模型的输入嵌入层权重（model.embed_tokens.weight）与语言模型头权重（lm_head.weight）共享。
+      修改其中任何一个的权重都会直接影响另一个。
+
+代码示例:
+    >>> from transformers import AutoTokenizer
+    >>> # 假设 TinyMindConfig 和本类已正确注册到 AutoModelForCausalLM
+    >>> tokenizer = AutoTokenizer.from_pretrained("tiny-mind-base")
+    >>> model = TinyMindForCausalLM(config)
+    >>> inputs = tokenizer("Hello, world", return_tensors="pt")
+    >>> # 使用 generate 方法进行文本生成
+    >>> outputs = model.generate(**inputs, max_new_tokens=20)
+    >>> print(tokenizer.decode(outputs[0]))
+"""
+class TinyMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = TinyMindConfig
+
+    def __init__(self, config: TinyMindConfig):
+        """
+        初始化 TinyMind 模型。
+        
+        Args:
+            config (TinyMindConfig): 模型的配置对象，包含模型的各种超参数（如隐藏层大小、词表大小等）。
+        """
+        super().__init__(config)
+        self.model = TinyMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model.embed_tokens.weight = self.lm_head.weight
+    
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **args):
+        """
+        模型的前向传播方法。
+
+        Args:
+            input_ids (Optional[torch.Tensor]): 输入序列的词元ID张量。
+            attention_mask (Optional[torch.Tensor]): 注意力掩码张量，用于避免对填充词元进行注意力计算。
+            labels (Optional[torch.Tensor]): 用于计算语言模型损失的真实标签张量。
+            past_key_values (Optional[List[Tuple[torch.Tensor, torch.Tensor]]]): 预计算的键值对，用于加速自回归解码。
+            use_cache (bool): 是否返回过去的键值值对以加速后续解码。默认为 False。
+            logits_to_keep (Union[int, torch.Tensor]): 指定需要计算logits的隐藏状态数量或索引。
+                如果为整数，则保留最后 `logits_to_keep` 个隐藏状态；如果为张量，则作为直接索引。默认为 0。
+            **args: 传递给内部模型的其他关键字参数。
+
+        Returns:
+            CausalLMOutputWithPast: 包含因果语言模型输出的对象，具体包含以下属性：
+                - logits (torch.Tensor): 语言模型头的预测logits。
+                - past_key_values (List[Tuple[torch.Tensor, torch.Tensor]]): 可用于加速后续生成的预计算键值对。
+                - hidden_states (torch.Tensor): 模型最后一层的隐藏状态。
+        """
+
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args,
+        )
+
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
+
