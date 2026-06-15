@@ -784,7 +784,8 @@ class TinyMindModel(nn.Module):
                     - presents (List): 各个解码器层的当前KV缓存状态列表，用于后续的前向传播。
             """
             batch_size, seq_length = input_ids.shape
-            if hasattr(past_key_values, 'layers'): past_key_values = None
+            if hasattr(past_key_values, 'layers'): 
+                past_key_values = None
             past_key_values = past_key_values or [None] * len(self.layers)
             start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
             hidden_states = self.dropout(self.embed_tokens(input_ids))
