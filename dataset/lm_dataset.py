@@ -67,3 +67,67 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.05):
     ):
         prompt_content = prompt_content.replace("<think>\n\n</think>\n\n", "")
     return prompt_content
+
+class PretrainDataset(Dataset):
+    """
+    用于自回归语言模型预训练的数据集类。
+
+    本类负责从 JSON 文件中加载文本数据，将其转换为模型预训练所需的 
+    input_ids、labels 和 attention_mask 格式。核心处理流程包括：对文本
+    进行分词、拼接 BOS/EOS 特殊标记、对序列进行定长填充（Padding），以及
+    将填充位置的标签置为 -100 以便在计算交叉熵损失时自动忽略。
+
+    构造函数参数:
+        data_path (str): 训练数据的 JSON 文件路径。数据需包含 "text" 字段。
+        tokenizer: 分词器实例，需支持 `bos_token_id`、`eos_token_id` 和 
+                   `pad_token_id` 属性，以及标准的 `__call__` 分词方法。
+        max_length (int, optional): 序列的最大长度，默认为 512。包含 BOS 和 
+                   EOS 在内，超出部分将被截断，不足部分将用 PAD 填充。
+
+    使用限制与注意事项:
+        - 传入的 tokenizer 必须已定义 BOS、EOS 和 PAD 标记，否则在获取 
+          token_id 时会抛出异常。
+        - 数据集会一次性加载到内存中，如果 JSON 文件极大，可能会造成内存溢出。
+
+    代码示例:
+        >>> from transformers import AutoTokenizer
+        >>> tokenizer = AutoTokenizer.from_pretrained("your-model-name")
+        >>> dataset = PretrainDataset(data_path="train.json", tokenizer=tokenizer, max_length=1024)
+        >>> input_ids, labels, attention_mask = dataset[0]
+    """
+    def __init__(self, data_path, tokenizer, max_length=512):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.samples = load_dataset('json', data_files=data_path, split='train')
+
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        # Step 1：tokenize 原始文本，留出首尾各 1 个 token 的位置给 BOS/EOS
+        tokens = self.tokenizer(
+            str(sample["text"]),
+            add_special_tokens=False,
+            max_length=self.max_length - 2,  # 预留 BOS + EOS 的位置
+            truncation=True,
+        ).input_ids
+
+        # Step 2：拼接 BOS + token序列 + EOS，构成完整序列
+        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+
+        # Step 3：右侧用 PAD 补齐到 max_length，保证 batch 内等长
+        input_ids = tokens + [self.tokenizer.pad_token_id] * (
+            self.max_length - len(tokens)
+        )
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+
+        # Step 4：labels 与 input_ids 完全相同，但 PAD 位置置 -100，
+        #         CrossEntropyLoss 会自动忽略 -100，不计入 loss
+        labels = input_ids.clone()
+        labels[input_ids == self.tokenizer.pad_token_id] = -100
+
+        # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
+        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+        return input_ids, labels, attention_mask
